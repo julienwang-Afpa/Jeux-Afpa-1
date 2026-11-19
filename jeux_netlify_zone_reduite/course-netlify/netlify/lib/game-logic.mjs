@@ -1,137 +1,3 @@
-import { randomBytes, timingSafeEqual } from 'node:crypto';
-import { colors, duration, games, pointsFor } from '../../public/games.mjs';
-import { staged, arenaScores } from './staged.mjs';
-
-const COUNTDOWN = 8000;   // décompte avant chaque manche : le temps de relire la règle
-const GRACE = 2500;       // délai pour recevoir les derniers scores
-const MAX_PLAYERS = 40;
-
-const json = (status, data) => new Response(JSON.stringify(data), {
-  status,
-  headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' },
-});
-const fail = (status, error) => json(status, { error });
-const validToken = value => typeof value === 'string' && /^[a-f0-9]{32}$/.test(value);
-const matches = (a, b) => validToken(a) && validToken(b) && timingSafeEqual(Buffer.from(a), Buffer.from(b));
-const read = (store, key) => store.getWithMetadata(key, { type: 'json' });
-const save = (store, key, entry, data) => store.setJSON(key, data, entry ? { onlyIfMatch: entry.etag } : { onlyIfNew: true });
-const identity = ({ pid, name, color }) => ({ pid, name, color });
-const isInt = (v, min, max) => Number.isInteger(v) && v >= min && v <= max;
-
-// ---------- Vue envoyée aux navigateurs ----------
-function publicRound(round) {
-  if (!round) return null;
-  const { questions, ...rest } = round;
-  if (round.stage && staged[round.game]) rest.stage = staged[round.game].publicStage(round);
-  // Vrai ou faux : les points ne bougent qu'au moment de la réponse, pour ne pas la trahir.
-  if (round.game === 'truefalse' && !round.results && round.stage?.phase !== 'answer') rest.tally = round.shownTally || {};
-  if (round.game === 'truefalse' && round.stage?.phase === 'answer') rest.tally = round.tally;
-  return rest;
-}
-
-function view(st, now, pid, isHost) {
-  return {
-    now,
-    players: Object.values(st.roster).map(identity),
-    joined: Boolean(pid && st.roster[pid]),
-    series: st.series, pending: st.pending, totals: st.totals,
-    round: st.round && { ...publicRound(st.round), playing: Boolean(pid && st.round.ids.includes(pid)) },
-    revision: isHost ? st.revision || 0 : undefined,
-  };
-}
-
-// ---------- Classement d'une manche ----------
-export function rankRound(round, roster, players) {
-  const subs = new Map(players.filter(p => p?.score?.round === round.id).map(p => [p.pid, p.score]));
-  const arena = round.game === 'arena' ? arenaScores(round) : null;
-  const entries = round.ids.filter(pid => roster[pid]).map(pid => {
-    const base = identity(roster[pid]);
-    if (arena) return { ...base, score: arena[pid], raw: arena[pid], played: true };
-    if (staged[round.game]) {
-      const score = round.tally[pid] || 0;
-      return { ...base, score, raw: score, played: Boolean(round.played[pid]) };
-    }
-    const sub = subs.get(pid);
-    return { ...base, score: sub?.score ?? 0, raw: sub?.raw ?? 0, tb: sub?.tb, played: Boolean(sub) };
-  });
-  const tb = e => e.tb ?? Infinity;
-  const players_ = entries.filter(e => e.played).sort((a, b) => b.score - a.score || tb(a) - tb(b));
-  const absent = entries.filter(e => !e.played);
-  const multiplier = round.rule === 'double' ? 2 : 1;
-  players_.forEach((e, i) => {
-    const prev = players_[i - 1];
-    e.rank = prev && prev.score === e.score && tb(prev) === tb(e) ? prev.rank : i + 1;
-    e.points = pointsFor(e.rank, players_.length, multiplier);
-  });
-  absent.forEach(e => { e.rank = null; e.points = 0; });
-  return [...players_, ...absent];
-}
-
-function complete(st, players) {
-  const round = st.round;
-  round.results = rankRound(round, st.roster, players);
-  round.before = { ...st.totals };
-  if (!round.practice) {
-    for (const r of round.results) st.totals[r.pid] = (st.totals[r.pid] || 0) + r.points;
-    st.series.played++;
-  }
-  round.endedAt = Date.now();
-  st.pending = st.series.played < st.series.total ? { rule: 'classic', practice: false } : null;
-}
-
-const readPlayers = (store, room, ids) => Promise.all(ids.map(id => store.get(`room/${room}/p/${id}`, { type: 'json' })));
-
-// ---------- Point d'entrée ----------
-export async function handle(req, store) {
-  const path = new URL(req.url).pathname.replace(/^\/api\//, '');
-  if (req.method !== 'POST') return fail(405, 'Requête POST requise.');
-  let body;
-  try {
-    const raw = await req.text();
-    if (raw.length > 4096) return fail(413, 'Requête trop longue.');
-    body = JSON.parse(raw);
-  } catch {
-    return fail(400, 'Requête invalide.');
-  }
-  if (!body || !validToken(body.token)) return fail(400, 'Session invalide.');
-
-  if (path === 'create') {
-    for (let attempt = 0; attempt < 8; attempt++) {
-      const room = randomBytes(4).toString('hex').slice(0, 5);
-      const state = { host: body.token, roster: {}, series: null, round: null, pending: null, totals: {}, revision: 0 };
-      if ((await save(store, `room/${room}/state`, null, state)).modified) return json(200, { room });
-    }
-    return fail(503, 'Réessaie de créer la partie.');
-  }
-
-  const { room, pid, token } = body;
-  if (typeof room !== 'string' || !/^[a-f0-9]{5}$/.test(room)) return fail(400, 'Code de partie invalide.');
-  const key = `room/${room}/state`;
-  const playerKey = id => `room/${room}/p/${id}`;
-
-  for (let attempt = 0; attempt < 25; attempt++) {
-    const entry = await read(store, key);
-    const st = entry?.data;
-    if (!st?.roster) return fail(404, 'Partie introuvable. Vérifie le code affiché.');
-    const now = Date.now();
-    const isHost = path === 'host' && matches(token, st.host);
-    if (path === 'host' && !isHost) return fail(403, 'Session animateur invalide.');
-    if (!isHost && !validToken(pid)) return fail(400, 'Identifiant joueur invalide.');
-    const player = st.roster[pid];
-    if (player && !matches(token, player.token)) return fail(403, 'Session joueur invalide.');
-    const round = st.round;
-    const active = round && !round.results;
-
-    if (path === 'join') {
-      if (player) return json(200, view(st, now, pid, false));
-      const name = String(body.name ?? '').replace(/[\p{Cc}\p{Cf}]/gu, '').trim().slice(0, 16);
-      if (!name || !colors.includes(body.color)) return fail(400, 'Indique un prénom et une couleur.');
-      if (Object.keys(st.roster).length >= MAX_PLAYERS) return fail(409, 'La partie est complète.');
-      if (Object.values(st.roster).some(p => p.name.toLowerCase() === name.toLowerCase())) return fail(409, 'Ce prénom est déjà pris : ajoute une initiale.');
-      st.roster[pid] = { pid, name, color: body.color, token };
-    } else if (path === 'player') {
-      const mine = player ? (await store.get(playerKey(pid), { type: 'json' })) : null;
-      return json(200, { ...view(st, now, pid, false), mine });
     } else if (path === 'score' || path === 'pick') {
       if (!player || !active || body.round !== round.id || !round.ids.includes(pid) || now < round.startAt) {
         return fail(409, 'Cette action ne correspond plus à la manche.');
@@ -185,19 +51,27 @@ export async function handle(req, store) {
           if (game.needsPicks(round.stage)) {
             const docs = await readPlayers(store, room, round.ids);
             picks = new Map(docs.filter(d => d?.pick?.round === round.id && d.pick.step === round.stage.step).map(d => [d.pid, d.pick.value]));
+            for (const id of round.ids) if (st.roster[id]?.botSkill) { const value=botPick(round,st.roster[id]); if(value!==null) picks.set(id,value); }
           }
           if (!game.advance(round, picks, now)) complete(st, []);
         } else if (active && !game && now >= round.endAt + GRACE) {
-          complete(st, await readPlayers(store, room, round.ids));
+          complete(st, addBotsToDocs(st,round,await readPlayers(store, room, round.ids),now));
         } else {
           const result = view(st, now, null, true);
           if (active && !game && now >= round.startAt) {
             // Progression en direct pour le projecteur (lecture seule, aucune écriture).
-            const docs = await readPlayers(store, room, round.ids);
+            const docs = addBotsToDocs(st,round,await readPlayers(store, room, round.ids),now);
             result.live = Object.fromEntries(docs.filter(d => d?.score?.round === round.id).map(d => [d.pid, d.score.score]));
           }
           return json(200, result);
         }
+      } else if (action === 'add-bots') {
+        if (active) return fail(409, 'Attends la fin de la manche pour ajouter les robots.');
+        const existing = Object.values(st.roster).filter(p => p.botSkill).length;
+        if (existing >= 3) return fail(409, 'Les trois robots sont déjà dans la partie.');
+        if (Object.keys(st.roster).length + (3-existing) > MAX_PLAYERS) return fail(409, 'Pas assez de places disponibles.');
+        const labels=['Robot Raisin','Robot Gamay','Robot Tonneau'];
+        for(let i=existing;i<3;i++){let pid=randomBytes(16).toString('hex');st.roster[pid]={pid,name:'🤖 '+labels[i],color:colors[(i*3+2)%colors.length],token:randomBytes(16).toString('hex'),botSkill:[1,.85,.7][i]};}
       } else if (action === 'series') {
         if (active) return fail(409, 'Attends la fin de la manche.');
         if (!Object.hasOwn(games, body.game) || !isInt(body.total, 1, 5)) return fail(400, 'Série invalide.');
@@ -234,7 +108,7 @@ export async function handle(req, store) {
         else return fail(409, 'La manche se termine déjà.');
       } else if (action === 'reset') {
         if (active) return fail(409, 'Attends la fin de la manche.');
-        st.totals = {}; st.series = null; st.pending = null; st.round = null;
+        st.totals = {}; st.history = []; st.series = null; st.pending = null; st.round = null;
       } else if (action === 'remove') {
         if (active) return fail(409, 'Attends la fin de la manche.');
         if (!st.roster[body.player]) return fail(404, 'Joueur introuvable.');
