@@ -1,0 +1,9 @@
+# The site's base directory is "jeux-beaujolais-version-finale", but the app lives
+# in the "course-netlify" subfolder. These paths point Netlify to it.
+[build]
+  command = "npm install --prefix course-netlify"
+  publish = "course-netlify/public"
+
+[functions]
+  directory = "course-netlify/netlify/functions"
+  node_bundler = "esbuild"
